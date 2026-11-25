@@ -1,21 +1,83 @@
-# Bank Account Management System (Streamlit version - fixed)
-# Uses: functions, loops, if/else, file handling, classes and objects
-# Run with:  streamlit run bank_app.py
+"""Bank Account Manager - Python + Streamlit (now with PIN security).
 
+Run:  streamlit run bank_app.py
+
+Every account has a 4-digit PIN. The PIN is asked for on EVERY operation:
+deposit, withdraw, transfer (sender's PIN), check balance and delete.
+The PIN is never stored as plain text: only a salted hash is saved.
+3 wrong PINs lock the account for 5 minutes (saved in the file, so a
+page refresh does not reset it).
+"""
+
+import hashlib
+import hmac
 import os
+import secrets
+import time
+
 import streamlit as st
 
-FILE_NAME = "accounts.txt"
-TEMP_NAME = "accounts.tmp"
+DATA_FILE = "accounts.txt"
+FIRST_NUMBER = 1001
+MAX_TRIES = 3
+LOCK_SECONDS = 300
 
 
-# ---------- Account class ----------
+# ---------------------------------------------------------------- PIN helpers
+def valid_pin_format(pin):
+    return isinstance(pin, str) and len(pin) == 4 and pin.isdigit()
+
+
+def hash_pin(pin, salt_hex):
+    return hashlib.pbkdf2_hmac(
+        "sha256", pin.encode(), bytes.fromhex(salt_hex), 100_000
+    ).hex()
+
+
+# -------------------------------------------------------------------- Account
 class Account:
-    def __init__(self, acc_no, name, balance=0.0):
-        self.acc_no = acc_no
+    def __init__(self, number, name, balance, salt="", pin_hash="",
+                 fails=0, locked_until=0.0):
+        self.number = number
         self.name = name
-        self.balance = round(balance, 2)
+        self.balance = round(float(balance), 2)
+        self.salt = salt
+        self.pin_hash = pin_hash
+        self.fails = fails
+        self.locked_until = locked_until
 
+    # --- PIN rules
+    def set_pin(self, pin):
+        self.salt = secrets.token_hex(16)
+        self.pin_hash = hash_pin(pin, self.salt)
+        self.fails = 0
+        self.locked_until = 0.0
+
+    def lock_seconds_left(self):
+        return max(0, int(self.locked_until - time.time()))
+
+    def check_pin(self, pin):
+        """Returns (True/False, message). Caller must save the bank after."""
+        if not self.pin_hash:
+            return False, ("This account has no PIN (old file format). "
+                           "Clear accounts.txt and create the account again.")
+        left = self.lock_seconds_left()
+        if left:
+            return False, f"Account is locked. Try again in {left} seconds."
+        if not valid_pin_format(pin):
+            return False, "PIN must be exactly 4 digits."
+        if hmac.compare_digest(hash_pin(pin, self.salt), self.pin_hash):
+            self.fails = 0
+            return True, "PIN correct."
+        self.fails += 1
+        if self.fails >= MAX_TRIES:
+            self.fails = 0
+            self.locked_until = time.time() + LOCK_SECONDS
+            return False, (f"Wrong PIN {MAX_TRIES} times. "
+                           f"Account locked for {LOCK_SECONDS // 60} minutes.")
+        return False, f"Wrong PIN. {MAX_TRIES - self.fails} tries left."
+
+    # --- money rules
     def deposit(self, amount):
         amount = round(amount, 2)
         if amount <= 0:
@@ -30,214 +92,215 @@ class Account:
         self.balance = round(self.balance - amount, 2)
         return True
 
+    # --- file format: number|name|balance|salt|pin_hash|fails|locked_until
+    def to_line(self):
+        return "|".join([str(self.number), self.name, f"{self.balance:.2f}",
+                         self.salt, self.pin_hash, str(self.fails),
+                         f"{self.locked_until:.0f}"])
 
-# ---------- Bank class ----------
+    @staticmethod
+    def from_line(line):
+        p = line.strip().split("|")
+        if len(p) == 3:                       # old format, no PIN
+            return Account(int(p[0]), p[1], float(p[2]))
+        number, name, balance, salt, pin_hash, fails, locked = p
+        return Account(int(number), name, float(balance), salt, pin_hash,
+                       int(fails), float(locked))
+
+
+# ----------------------------------------------------------------------- Bank
 class Bank:
-    def __init__(self):
+    def __init__(self, path=DATA_FILE):
+        self.path = path
         self.accounts = []
+        self.load_data()
 
-    def create_account(self, name, initial_balance):
-        if len(self.accounts) == 0:
-            acc_no = 1001
-        else:
-            acc_no = max(acc.acc_no for acc in self.accounts) + 1
-        account = Account(acc_no, name, initial_balance)
-        self.accounts.append(account)
-        return account
+    def load_data(self):
+        """Read fresh from file every time. Broken lines are skipped."""
+        self.accounts = []
+        if not os.path.exists(self.path):
+            return
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    self.accounts.append(Account.from_line(line))
+                except ValueError:
+                    continue
 
-    def find_account(self, acc_no):
-        for account in self.accounts:
-            if account.acc_no == acc_no:
-                return account
+    def save_data(self):
+        """Write to a temp file, then swap it in (safe saving)."""
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for acc in self.accounts:
+                f.write(acc.to_line() + "\n")
+        os.replace(tmp, self.path)
+
+    def find_account(self, number):
+        for acc in self.accounts:
+            if acc.number == number:
+                return acc
         return None
 
-    def transfer(self, from_no, to_no, amount):
-        sender = self.find_account(from_no)
-        receiver = self.find_account(to_no)
-        if sender is None or receiver is None:
-            return False, "Account not found."
+    def next_number(self):
+        if not self.accounts:
+            return FIRST_NUMBER
+        return max(a.number for a in self.accounts) + 1
+
+    def verify(self, number, pin):
+        """Find the account and check its PIN. Saves the attempt counter."""
+        acc = self.find_account(number)
+        if acc is None:
+            return None, "Account not found."
+        ok, msg = acc.check_pin(pin)
+        self.save_data()
+        return (acc if ok else None), msg
+
+    # --- operations (each one needs the PIN)
+    def create_account(self, name, balance, pin, pin_again):
+        name = name.strip()
+        if not name or "|" in name:
+            return False, "Enter a valid name (no empty name, no | sign)."
+        if balance < 0:
+            return False, "Opening balance cannot be negative."
+        if not valid_pin_format(pin):
+            return False, "PIN must be exactly 4 digits."
+        if pin != pin_again:
+            return False, "The two PINs do not match."
+        acc = Account(self.next_number(), name, balance)
+        acc.set_pin(pin)
+        self.accounts.append(acc)
+        self.save_data()
+        return True, f"Account created. Account number: {acc.number}"
+
+    def deposit(self, number, pin, amount):
+        acc, msg = self.verify(number, pin)
+        if acc is None:
+            return False, msg
+        if not acc.deposit(amount):
+            return False, "Amount must be above zero."
+        self.save_data()
+        return True, f"Deposited. New balance: Rs {acc.balance:,.2f}"
+
+    def withdraw(self, number, pin, amount):
+        acc, msg = self.verify(number, pin)
+        if acc is None:
+            return False, msg
+        if not acc.withdraw(amount):
+            return False, "Amount must be above zero and within your balance."
+        self.save_data()
+        return True, f"Withdrawn. New balance: Rs {acc.balance:,.2f}"
+
+    def transfer(self, from_no, pin, to_no, amount):
         if from_no == to_no:
-            return False, "Cannot transfer to the same account."
+            return False, "Both accounts must be different."
+        receiver = self.find_account(to_no)
+        if receiver is None:
+            return False, "Receiver account not found."
+        sender, msg = self.verify(from_no, pin)      # only SENDER's PIN
+        if sender is None:
+            return False, msg
         if not sender.withdraw(amount):
-            return False, "Transfer failed: invalid amount or low balance."
+            return False, "Amount must be above zero and within your balance."
         receiver.deposit(amount)
-        return True, "Transfer successful."
+        self.save_data()
+        return True, (f"Transferred Rs {round(amount, 2):,.2f} to "
+                      f"{receiver.name}. Your balance: Rs {sender.balance:,.2f}")
 
-    def delete_account(self, acc_no):
-        account = self.find_account(acc_no)
-        if account is None:
-            return False
-        self.accounts.remove(account)
-        return True
+    def check_balance(self, number, pin):
+        acc, msg = self.verify(number, pin)
+        if acc is None:
+            return False, msg
+        return True, f"{acc.name}: Rs {acc.balance:,.2f}"
 
+    def delete_account(self, number, pin, confirmed):
+        acc, msg = self.verify(number, pin)
+        if acc is None:
+            return False, msg
+        if not confirmed:
+            return False, "Tick the confirmation box to delete."
+        self.accounts.remove(acc)
+        self.save_data()
+        return True, f"Account {number} deleted."
 
-# ---------- File handling ----------
-def save_data(bank):
-    # Write to a temp file first, then replace - file never ends up half-written
-    with open(TEMP_NAME, "w") as file:
-        for acc in bank.accounts:
-            file.write(f"{acc.acc_no},{acc.name},{acc.balance}\n")
-    os.replace(TEMP_NAME, FILE_NAME)
-
-
-def load_data(bank):
-    open(FILE_NAME, "a").close()  # creates the file if it doesn't exist
-    with open(FILE_NAME, "r") as file:
-        for line in file:
-            line = line.strip()
-            if line == "":
-                continue
-            try:
-                acc_no_text, rest = line.split(",", 1)
-                name, balance_text = rest.rsplit(",", 1)  # name may contain commas
-                bank.accounts.append(Account(int(acc_no_text), name, float(balance_text)))
-            except ValueError:
-                continue  # skip a broken line instead of crashing the app
+    def public_list(self):
+        """Balances are private, so the list shows only number and name."""
+        return [{"Acc no": a.number, "Name": a.name} for a in self.accounts]
 
 
-# ---------- Streamlit helpers ----------
-def done(message):
-    # Show message after refresh so dropdowns and balances are up to date
-    st.session_state["flash"] = message
-    st.rerun()
+# ------------------------------------------------------------------------- UI
+def show(result):
+    ok, msg = result
+    (st.success if ok else st.error)(msg)
 
 
-def account_label(acc_no):
-    acc = bank.find_account(acc_no)
-    return f"{acc.acc_no} - {acc.name}"
+def main():
+    st.set_page_config(page_title="Bank Account Manager", page_icon="🏦")
+    st.title("🏦 Bank Account Manager")
+    st.caption("Demo project: no real money is involved. "
+               "Every operation needs your 4-digit PIN.")
 
+    bank = Bank()      # fresh read on every refresh
+    menu = ["Create account", "Deposit", "Withdraw", "Transfer",
+            "Check balance", "Show all accounts", "Delete account"]
+    choice = st.sidebar.radio("Menu", menu)
 
-# ---------- Streamlit UI ----------
-st.set_page_config(page_title="Bank Account Management", page_icon="🏦")
-st.title("🏦 Bank Account Management System")
+    if choice == "Create account":
+        with st.form("create"):
+            name = st.text_input("Account holder name")
+            bal = st.number_input("Opening balance (Rs)", min_value=0.0,
+                                  step=100.0, format="%.2f")
+            pin = st.text_input("Set a 4-digit PIN", type="password",
+                                max_chars=4)
+            pin2 = st.text_input("Confirm PIN", type="password", max_chars=4)
+            if st.form_submit_button("Create"):
+                show(bank.create_account(name, bal, pin, pin2))
 
-# Always read fresh data from the file (no stale data, works across browser tabs)
-bank = Bank()
-load_data(bank)
-account_numbers = [acc.acc_no for acc in bank.accounts]
+    elif choice in ("Deposit", "Withdraw", "Check balance"):
+        with st.form(choice):
+            number = st.number_input("Account number", min_value=0, step=1)
+            pin = st.text_input("PIN", type="password", max_chars=4)
+            amount = 0.0
+            if choice != "Check balance":
+                amount = st.number_input("Amount (Rs)", min_value=0.0,
+                                         step=100.0, format="%.2f")
+            if st.form_submit_button(choice):
+                if choice == "Deposit":
+                    show(bank.deposit(int(number), pin, amount))
+                elif choice == "Withdraw":
+                    show(bank.withdraw(int(number), pin, amount))
+                else:
+                    show(bank.check_balance(int(number), pin))
 
-if "flash" in st.session_state:
-    st.success(st.session_state.pop("flash"))
+    elif choice == "Transfer":
+        with st.form("transfer"):
+            from_no = st.number_input("Your account number", min_value=0,
+                                      step=1)
+            pin = st.text_input("Your PIN", type="password", max_chars=4)
+            to_no = st.number_input("Send to account number", min_value=0,
+                                    step=1)
+            amount = st.number_input("Amount (Rs)", min_value=0.0,
+                                     step=100.0, format="%.2f")
+            if st.form_submit_button("Transfer"):
+                show(bank.transfer(int(from_no), pin, int(to_no), amount))
 
-menu = [
-    "Create account",
-    "Deposit",
-    "Withdraw",
-    "Transfer",
-    "Check balance",
-    "Show all accounts",
-    "Delete account",
-]
-choice = st.sidebar.radio("Menu", menu)
-
-
-if choice == "Create account":
-    st.subheader("Create account")
-    with st.form("create_form", clear_on_submit=True):
-        name = st.text_input("Account holder name")
-        amount = st.number_input("Opening balance", min_value=0.0, value=0.0, step=100.0, format="%.2f")
-        submitted = st.form_submit_button("Create")
-    if submitted:
-        if name.strip() == "":
-            st.error("Invalid name.")
+    elif choice == "Show all accounts":
+        rows = bank.public_list()
+        if rows:
+            st.table(rows)
+            st.caption("Balances are hidden. Use Check balance with your PIN.")
         else:
-            acc = bank.create_account(name.strip(), amount)
-            save_data(bank)
-            done(f"Account created. Your account number is {acc.acc_no}")
+            st.info("No accounts yet.")
 
-elif choice == "Deposit":
-    st.subheader("Deposit")
-    if len(bank.accounts) == 0:
-        st.info("No accounts yet.")
-    else:
-        with st.form("deposit_form"):
-            acc_no = st.selectbox("Account", account_numbers, format_func=account_label)
-            amount = st.number_input("Amount to deposit", min_value=0.0, value=0.0, step=100.0, format="%.2f")
-            submitted = st.form_submit_button("Deposit")
-        if submitted:
-            acc = bank.find_account(acc_no)
-            if acc.deposit(amount):
-                save_data(bank)
-                done(f"Deposited. New balance of account {acc.acc_no}: {acc.balance:.2f}")
-            else:
-                st.error("Invalid amount.")
+    else:  # Delete account
+        with st.form("delete"):
+            number = st.number_input("Account number", min_value=0, step=1)
+            pin = st.text_input("PIN", type="password", max_chars=4)
+            sure = st.checkbox("Yes, I want to delete this account")
+            if st.form_submit_button("Delete account"):
+                show(bank.delete_account(int(number), pin, sure))
 
-elif choice == "Withdraw":
-    st.subheader("Withdraw")
-    if len(bank.accounts) == 0:
-        st.info("No accounts yet.")
-    else:
-        with st.form("withdraw_form"):
-            acc_no = st.selectbox("Account", account_numbers, format_func=account_label)
-            amount = st.number_input("Amount to withdraw", min_value=0.0, value=0.0, step=100.0, format="%.2f")
-            submitted = st.form_submit_button("Withdraw")
-        if submitted:
-            acc = bank.find_account(acc_no)
-            if acc.withdraw(amount):
-                save_data(bank)
-                done(f"Withdrawn. New balance of account {acc.acc_no}: {acc.balance:.2f}")
-            else:
-                st.error("Invalid amount or insufficient balance.")
 
-elif choice == "Transfer":
-    st.subheader("Transfer")
-    if len(bank.accounts) < 2:
-        st.info("You need at least 2 accounts to make a transfer.")
-    else:
-        with st.form("transfer_form"):
-            from_no = st.selectbox("From account", account_numbers, format_func=account_label)
-            to_no = st.selectbox("To account", account_numbers, index=1, format_func=account_label)
-            amount = st.number_input("Amount", min_value=0.0, value=0.0, step=100.0, format="%.2f")
-            submitted = st.form_submit_button("Transfer")
-        if submitted:
-            ok, message = bank.transfer(from_no, to_no, amount)
-            if ok:
-                save_data(bank)
-                done(message)
-            else:
-                st.error(message)
-
-elif choice == "Check balance":
-    st.subheader("Check balance")
-    if len(bank.accounts) == 0:
-        st.info("No accounts yet.")
-    else:
-        acc_no = st.selectbox("Account", account_numbers, format_func=account_label)
-        acc = bank.find_account(acc_no)
-        st.write(f"**Account No:** {acc.acc_no}")
-        st.write(f"**Name:** {acc.name}")
-        st.write(f"**Balance:** {acc.balance:.2f}")
-
-elif choice == "Show all accounts":
-    st.subheader("All accounts")
-    if len(bank.accounts) == 0:
-        st.info("No accounts yet.")
-    else:
-        rows = []
-        for acc in bank.accounts:
-            rows.append(
-                {
-                    "Account No": acc.acc_no,
-                    "Name": acc.name,
-                    "Balance": f"{acc.balance:.2f}",
-                }
-            )
-        st.table(rows)
-
-elif choice == "Delete account":
-    st.subheader("Delete account")
-    if len(bank.accounts) == 0:
-        st.info("No accounts yet.")
-    else:
-        with st.form("delete_form"):
-            acc_no = st.selectbox("Account", account_numbers, format_func=account_label)
-            confirm = st.checkbox("I am sure I want to delete this account")
-            submitted = st.form_submit_button("Delete")
-        if submitted:
-            if not confirm:
-                st.warning("Please tick the confirmation box first.")
-            elif bank.delete_account(acc_no):
-                save_data(bank)
-                done("Account deleted.")
-            else:
-                st.error("Account not found.")
+if __name__ == "__main__":
+    main()
